@@ -1,0 +1,501 @@
+#!/usr/bin/env python
+"""
+    recastex - re-podcast media managed by git-annex
+
+    Copyright (C) 2018 Stewart V. Wright <stewart@vifortech.com>
+        Supported by Vifortech Solutions.
+
+    This program is free software: you can redistribute it and/or modify
+    it under the terms of the GNU General Public License as published by
+    the Free Software Foundation, either version 3 of the License, or
+    (at your option) any later version.
+
+    This program is distributed in the hope that it will be useful,
+    but WITHOUT ANY WARRANTY; without even the implied warranty of
+    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+    GNU General Public License for more details.
+
+    You should have received a copy of the GNU General Public License
+    along with this program.  If not, see <https://www.gnu.org/licenses/>.
+"""
+import os
+import re
+import yaml
+import json
+import argparse
+import subprocess
+import imghdr
+import urllib.request
+import feedparser
+from feedgen.feed import FeedGenerator
+from pprint import pprint
+
+TOOL = 'recastex'
+VERSION = '1.0'
+ORIGIN = '<a href="https://github.com/stewart123579/recastex">https://github.com/stewart123579/recastex</a>'
+
+# Extra privacy check
+# `True` means that you need to use the command line flag
+#   '--talk-to-the-internet' to run internet connecting commands.
+PRIVACY = True
+
+
+def normalise_filename(text):
+    """Returns the given string converted to a string that should be cleaned a-la git-annex
+
+    >>> get_valid_filename("Amazing! Bob's photo from 2000.jpg")
+    'Amazing__Bob_s_photo_from_2000.jpg'
+    """
+    return re.sub('[^\w.]', '_', text)
+
+
+def tryadd(d, k1, k2, v2):
+    """Add elements to a dict
+    
+    Something like:
+        d[k1] = {....,  k2: v2}
+    BUT d[k1] may not exist, so handle that case
+    """
+    try:
+        d[k1].update({k2: v2})
+    except KeyError:
+        d[k1] = {k2: v2}
+
+    return d
+
+
+#############################
+#### This is based off:  https://stackoverflow.com/a/273227
+import os, errno
+
+def smartish_mkdir(directory):
+    """A smart(ish) mkdir.  Not entirely fool(!)-proof"""
+
+    try:
+        os.makedirs(directory)
+    except OSError as e:
+        if e.errno != errno.EEXIST:
+            raise
+
+
+
+
+def download_feed_image(imageurl, annex_dir, savedir='./recastex'):
+    """Download feed image and save locally"""
+
+    actual_path = None
+
+    if imageurl is not None:
+        base_filename = os.path.join(savedir, annex_dir)
+        smartish_mkdir(savedir)
+        save_path = base_filename + '.unknown'
+        urllib.request.urlretrieve(imageurl, save_path)
+
+        # Get the correct image type
+        image_type = imghdr.what(save_path)
+
+        if image_type is not None:
+            if image_type == 'jpeg':
+                image_type = 'jpg'
+            actual_path = base_filename + '.' + image_type
+            os.rename(save_path, actual_path)
+        else:
+            # Not an image
+            os.remove(save_path)
+
+    return actual_path
+
+
+
+def get_feed_attributes(url, feeds_dict={}, savedir='recastex', no_image=False):
+    """Create a dict of feed info & download image"""
+
+    feed = feedparser.parse(url)
+
+    try:
+        title = feed['feed']['title']
+    except KeyError:
+        raise KeyError('Need a title for the feed to make this work...')
+
+    annex_dir = normalise_filename(title)
+
+    if no_image:
+        imageurl_remote = None
+    else:
+        # The default value of an empty dict '{}' allows for missing either
+        # 'image' and 'href' keys.
+        imageurl_remote = feed['feed'].get('image', {}).get('href')
+
+    imageurl_local = download_feed_image(imageurl_remote, annex_dir, savedir)
+
+    tmp_dict= {'title': title,
+               'summary': feed['feed'].get('summary'),
+               'feedurl_remote': url.strip(),
+               'imageurl_remote': imageurl_remote,
+               'imageurl_local': imageurl_local,
+              }
+
+    feeds_dict[annex_dir] = dict((k, v) for k, v in tmp_dict.items() if v is not None)
+
+    return feeds_dict
+
+
+def save_as_yaml(config, feed_dict):
+    """Export the dict containing the feed data to a YAML file"""
+
+    if config['dry_run']:
+        print('DRY RUN: Would be saving feed summary to file... {}'.format(config['details']))
+    else:
+        if config['details'] is None:
+            yaml_stream = None
+        else:
+            smartish_mkdir(config['workdir'])
+            yaml_stream = open(config['details'], 'w')
+
+        retval = yaml.dump(data=feed_dict, stream=yaml_stream, default_flow_style=False)
+
+        try:
+            yaml_stream.close()
+        except AttributeError:
+            # If there stream is None then we can't close it.
+            pass
+
+        return retval
+
+
+def iterate_through_feeds(config, feedlist_file='feeds', feed_details={}, do_only=-1):
+    """Iterate through the feeds listed in `feedlist_file` and extract details"""
+
+    if config['dry_run']:
+        print('DRY RUN: Open file: {}  and iterate through feeds...'.format(feedlist_file))
+    else:
+        with open(feedlist_file, 'r') as f:
+            i = 0
+            for line in f:
+                if line[0] != '#':
+                    i += 1
+                    print('Feed: {:3}  -  {}'.format(i, line.strip()))
+                    get_feed_attributes(line, feed_details, savedir=config['workdir'], no_image=config['noimages'])
+                    if (do_only > 0) and (i >= do_only):
+                        break
+
+    return feed_details
+
+
+class GenerateFeed(object):
+    """Class for generating feeds"""
+
+    def __init__(self, config):
+        self.config = config
+        self.output_list = {}
+
+
+    def load_details(self):
+        self.feed_details = self.load_feed_details()
+        self.load_present_metadata()
+
+
+    def load_feed_details(self):
+        yaml_stream = open(self.config['details'], 'r')
+        feed_dict = yaml.load(yaml_stream)
+        yaml_stream.close()
+    
+        return feed_dict
+
+
+    def load_present_metadata(self):
+        """Load in metadata from file"""
+        self.metadata = {}
+
+        if not self.config['noregenmetadata'] or not os.path.isfile(self.config['metadata']):
+            f = self.regenerate_metadata()
+            self._process_metadata(f.strip().split('\n'))
+        else:
+            print('Using cached metadata')
+            with open(self.config['metadata'], 'r') as f:
+                self._process_metadata(f)
+
+
+    def _process_metadata(self, stream):
+        """Process metadata from stream
+
+        stream can be either
+        - a file: `with open(self.config['metadata'], 'r') as f:`, OR
+        - a list
+        """
+
+        if not self.config['dry_run']:
+            for i, line in enumerate(stream):
+                data = json.loads(line)
+                title = normalise_filename(data.get('fields', {}).get('feedtitle', ['Unknown'])[0])
+                # If there is no itemid field, use the filename
+                itemid = data['fields'].get('itemid', data['file'].split('/')[-1].split('.'))[0]
+                tryadd(self.metadata, title, itemid, data)
+
+
+    def generate_feed_title(self, feed_title):
+        return '{} - {}_{}'.format(feed_title, TOOL, VERSION)
+
+
+    def generate_feed_description(self, feed_description):
+        if feed_description is None:
+            feed_description = ""
+        return feed_description + """\n\nRecasting by {} version {}""".format(TOOL, VERSION)
+
+
+    def generate_feed(self, key):
+
+        if self.config['dry_run']:
+            print('DRY RUN: Would be generating feeds')
+            return None
+
+        try:
+            feed = self.feed_details[key]
+        except KeyError:
+            feed = {}
+
+        try:
+            metadata_values = self.metadata[key].values()
+        except KeyError:
+            metadata_values = {}
+
+        # Get link for this file
+        my_link = '{}/{}.xml'.format(self.config['url'], key)
+        # Generate title
+        title_raw = feed.get('title', 'UNKNOWN')
+        title_string = self.generate_feed_title(title_raw)
+        # Generate logo
+        try:
+            logo_url = self.config['url'] + '/' + feed['imageurl_local'].strip()
+        except KeyError:
+            logo_url = None
+
+        # Generate feed
+        fg = FeedGenerator()
+        fg.load_extension('podcast')
+
+        fg.title(title_string)
+        fg.id(my_link)
+        # FIXME
+        #fg.author( {'name':'John Doe','email':'john@example.de'} )
+        fg.link(href=my_link, rel='alternate' )
+
+        if logo_url is not None:
+            fg.logo(logo=logo_url)
+            fg.image(url=logo_url, title=title_string)
+            fg.podcast.itunes_image(logo_url)
+
+        fg.description(self.generate_feed_description(feed.get('summary')))
+
+        #fg.language('en')
+
+        for v in metadata_values:
+            fe = fg.add_entry()
+            fe.id(v['fields'].get('itemid', [v['key'].split('/')[-1]])[0])
+            fe.title(v['fields'].get('title', [v['file'].split('/')[-1].split('.')[0]])[0])
+            fe.description(v['fields'].get('itemsummary', ['No details'])[0])
+            fe.enclosure(self.config['url'] + '/' + v['file'], 0, 'audio/mpeg')
+            try:
+                pubdate = '{}-{:02d}-{:02d} 0:00 GMT'.format(int(v['fields']['year'][0]), int(v['fields']['month'][0]), int(v['fields']['day'][0]))
+                fe.published(pubdate)
+            except:
+                pass
+
+        #print(fg.rss_str(pretty=True))print(fg.rss_str(pretty=True))
+        output_file = '{}.xml'.format(key)
+        fg.rss_file(os.path.join(self.config['workdir'], output_file))
+
+        tryadd(self.output_list, 'Feeds', title_raw, self.config['url'] + '/' + self.config['workdir'] + '/' + output_file)
+        #print(logo_url)
+        print('Generated: ', title_string)
+
+
+    def create_index(self):
+        """Create a simple index.html file listing the files we've created"""
+        html = "<html> <head><title>{} v{} - Feeds</title></head><body>\n".format(TOOL,VERSION)
+        html += '<p>Code available at:  {}</p>'.format(ORIGIN)
+        html += "<p>Welcome to your {} index page.  Listed below are your RSS feeds.</p>".format(TOOL)
+        html += self._create_nested_lists()
+
+        html += '</body></html>'
+
+        if self.config['dry_run']:
+            print('DRY RUN: This is the HTML that would be created...')
+            print(html)
+        else:
+            with open('index.html', 'w') as fout:
+                fout.write(html)
+
+
+    def create_OPML(self):
+        """Create a simple all.opml file listing the files we've created"""
+
+        if self.config['dry_run']:
+            print('DRY RUN: Would be generating OPML')
+            return None
+
+        opml_file = os.path.join(self.config['workdir'], 'all.opml')
+        with open(opml_file, 'w') as fout:
+            fout.write('''<?xml version="1.0" encoding="utf-8"?>
+    <opml version="1.0">
+    <head><title>Subscriptions</title></head>
+    <body><outline title="Subscriptions">
+    ''')
+            for k, v in self.output_list['Feeds'].items():
+                fout.write(self._OPML_fragment(k, v, v))
+
+            fout.write("</outline></body></opml>\n")
+
+        tryadd(self.output_list, 'OPML Feeds', 'All generated feeds', opml_file)
+
+
+    def _create_html_li(self, string, link):
+        return('<li><a href="{}">{}</a></li>'.format(link, string))
+
+
+    def _create_feeds_list(self, in_dict):
+        retval = '<ul>\n'
+        for k, v in in_dict.items():
+            retval += self._create_html_li(k, v) + '\n'
+        retval += '</ul>'
+
+        return retval
+
+
+    def _create_nested_lists(self):
+        retval = '<ul>\n'
+        for k in self.output_list:
+            retval += '<li>{}</li>\n'.format(k)
+            retval += self._create_feeds_list(self.output_list[k]) + '\n'
+        retval += '</ul>'
+
+        return retval
+
+
+    def _OPML_fragment(self, title, blogLocation, rss):
+        """Given a triple (nickname, blog URL, RSS URL), returns a string
+        that's the proper OPML outline tag representing that info.
+        
+        Based on code from Python Cookbook, 2nd Ed."""
+
+        return '''<outline text="{}" htmlUrl="{}" type="rss" xmlUrl="{}"/>'''.format(title, blogLocation, rss)
+
+
+    def regenerate_metadata(self):
+        """Regenerate the metadata and save to file"""
+        ga_cmd = 'git annex metadata --json --in here'
+
+        notice = 'Regenerate metadata with command: {}'.format(ga_cmd)
+
+        if self.config['dry_run']:
+            print('DRY RUN: ', notice)
+            sp = None
+        else:
+            print(notice)
+            sp = subprocess.run(ga_cmd.split(), universal_newlines=True, check=True, stdout=subprocess.PIPE).stdout
+
+            with open(self.config['metadata'], 'w') as fout:
+                fout.write(sp)
+
+        return sp
+
+
+def arg_parse():
+    """Parse command line arguments"""
+
+    config = {
+        'workdir': 'recastex',
+        'dry_run': False,
+        'noimages': False,
+        'PRIVACY': PRIVACY,
+        'noregenmetadata': False,
+        'url': 'http://192.168.0.4:8080',
+    }
+    config.update({
+        'details': os.path.join(config['workdir'], 'feed_details.yml'),
+        'metadata': os.path.join(config['workdir'], 'metadata.json'),
+    })
+
+
+    parser = argparse.ArgumentParser(description='{} v{} - recast podcasts downloaded with git-annex'.format(TOOL, VERSION))
+
+    parser.add_argument('-n', '--dry-run', action='store_true',
+                        help="Dry-run, don't actually do anything")
+    parser.add_argument('--talk-to-the-internet', dest='PRIVACY', default=config['PRIVACY'],
+                        action='store_false',
+                        help="Allow this program to talk to the internet (DISALLOW internet access is '%(default)s' by default)")
+    parser.add_argument('-d', '--workdir', type=str, default=config['workdir'],
+                        help="Working directory for generated files (default %(default)s)")
+    parser.add_argument('-f', '--details', type=str, default=config['details'],
+                        help="Filename to feed details YAML file (default %(default)s)")
+    parser.add_argument('-m', '--metadata', type=str, default=config['metadata'],
+                        help="Filename to metadata details JSON file (default %(default)s)")
+    parser.add_argument('-u', '--url', type=str, default=config['url'],
+                        help="The URL from which the files will be served (default %(default)s)")
+    parser.add_argument('--noregenmetadata', action='store_true',
+                        help="Don't regenerate metadata - regenerating metadata can take some time (requires git-annex to be installed)")
+    parser.add_argument('--noimages', action='store_true',
+                        help="Don't download images in getinfo call (default %(default)s)")
+
+    parser.add_argument('TASK', type=str,
+                        help="getinfo|generate - get the feed info or generate the casts")
+
+    # Parse args
+    if __name__ == "__main__" and '__file__' in globals():
+        args = parser.parse_args()
+
+        # Update args
+        config.update(vars(args))
+
+        # Lower case the TASK
+        config['TASK'] = config['TASK'].lower()
+
+
+    if config['dry_run']:
+        print('Configuration settings:')
+        pprint(config)
+        if config['PRIVACY']:
+            netaccess = 'DISALLOW'
+        else:
+            netaccess = 'allow'
+        print('Privacy: {} internet access'.format(netaccess))
+
+    return config
+
+
+def run_getinfo(config):
+    """Master job for collecting feed info and storing locally"""
+    if not config['PRIVACY']:
+        feed_details = iterate_through_feeds(config)
+        save_as_yaml(config, feed_details)
+    else:
+        print('Not running as PRIVACY is defined.  You may want the "--talk-to-the-internet" flag')
+
+
+def run_generate(config):
+    """Master job for generating the casts"""
+    f = GenerateFeed(config)
+    f.load_details()
+
+    for k in f.metadata.keys():
+        print('Feed is: ', k)
+        f.generate_feed(k)
+
+    f.create_OPML()
+    f.create_index()
+
+
+def main():
+    config = arg_parse()
+
+    if config['TASK'] == 'getinfo':
+        run_getinfo(config)
+    elif config['TASK'] == 'generate':
+        run_generate(config)
+    else:
+        print('Unknown argument.')
+
+
+if __name__ == "__main__" and '__file__' in globals():
+    # The '__file__' check is for ipython...  https://stackoverflow.com/a/22923872
+    main()
