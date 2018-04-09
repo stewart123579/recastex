@@ -113,7 +113,7 @@ THISHOST=$(ifconfig | grep 192.168 | awk '{print $2}') \
         kyma/docker-nginx
 ```
 
-**Note:** The URL here `${THISHOST}:8080` should be the same as the URL used in recastex (`recastex --url ...`).
+**Note:** The URL here `${THISHOST}:8080` should point to the same location as the URL used in recastex (`recastex --url ...`).  I say *should* as Docker requires an IP address, whilst `recastex` can take an IP address (`192.168.0.3`) or a domain name (`mylappy.local` / `my.host.com`), but the addresses should be for the same machine (i.e. `mylappy.local == 192.168.0.3`).
 
 
 ### *Step 5* - Connect your podcast player
