@@ -31,7 +31,7 @@ from feedgen.feed import FeedGenerator
 from pprint import pprint
 
 TOOL = 'recastex'
-VERSION = '1.0'
+VERSION = '1.0.1'
 ORIGIN = '<a href="https://github.com/stewart123579/recastex">https://github.com/stewart123579/recastex</a>'
 
 # Extra privacy check
@@ -260,7 +260,7 @@ class GenerateFeed(object):
             metadata_values = {}
 
         # Get link for this file
-        my_link = '{}/{}.xml'.format(self.config['url'], key)
+        my_link = '{}/{}/{}.xml'.format(self.config['url'], self.config['workdir'], key)
         # Generate title
         title_raw = feed.get('title', 'UNKNOWN')
         title_string = self.generate_feed_title(title_raw)
